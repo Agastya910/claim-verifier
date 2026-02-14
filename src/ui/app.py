@@ -454,7 +454,7 @@ with tab2:
             )
 
             if question_input:
-                with st.spinner(f"Searching stored data for {focus_ticker}…"):
+                with st.spinner(f"Searching verified claims for {focus_ticker}…"):
                     answer_resp = api.post("/api/ask", data={
                         "ticker": focus_ticker,
                         "question": question_input,
@@ -467,15 +467,12 @@ with tab2:
                         f'</div>',
                         unsafe_allow_html=True,
                     )
-                    sources = answer_resp.get("sources", [])
-                    if sources:
-                        with st.expander("📚 Sources used", expanded=False):
-                            for i, s in enumerate(sources):
-                                st.caption(
-                                    f"Source {i+1}: {s.get('chunk_type', 'N/A')} | "
-                                    f"{s.get('source_type', 'N/A')} | "
-                                    f"{s.get('year', '?')} Q{s.get('quarter', '?')}"
-                                )
+                    claim_ids = answer_resp.get("claim_ids", [])
+                    num_claims = answer_resp.get("num_claims_used", 0)
+                    if claim_ids:
+                        with st.expander(f"📚 {num_claims} verified claim(s) used", expanded=False):
+                            for i, claim_id in enumerate(claim_ids):
+                                st.caption(f"{i+1}. Claim ID: {claim_id}")
                 else:
                     st.error("Failed to get an answer. Please try again.")
 
