@@ -447,7 +447,7 @@ async def ask_question(request: AskRequest, db: Session = Depends(get_db)):
     verified claims stored in the database. Uses lightweight keyword-based search
     on claims and verdicts. Does NOT use embeddings, pgvector, or RAG.
     """
-    from src.config import MODEL_CONFIGS, ACTIVE_MODEL_TIER
+    from src.config import MODEL_CONFIGS, ACTIVE_MODEL_TIER, OLLAMA_BASE_URL, OLLAMA_API_KEY, validate_ollama_config
     import litellm
     import re
 
@@ -489,11 +489,11 @@ async def ask_question(request: AskRequest, db: Session = Depends(get_db)):
                 matched_claims.extend(keyword_query.all())
         
         # Remove duplicates while preserving order
-        seen_ids = set()
+        seen_texts = set()
         unique_matches = []
         for claim, verdict in matched_claims:
-            if claim.id not in seen_ids:
-                seen_ids.add(claim.id)
+            if claim.raw_text not in seen_texts:
+                seen_texts.add(claim.raw_text)
                 unique_matches.append((claim, verdict))
         
         # If no keyword matches, fallback to most recent claims
@@ -511,15 +511,13 @@ async def ask_question(request: AskRequest, db: Session = Depends(get_db)):
         if not unique_matches:
             return {
                 "answer": f"No verified claims found for {ticker}. Please make sure the company has been analyzed.",
-                "claim_ids": [],
+                "claim_texts": [],
             }
         
         # Build structured context from retrieved claims
         context_blocks = []
-        claim_ids_used = []
         
         for claim, verdict in unique_matches:
-            claim_ids_used.append(claim.id)
             
             # Build structured context block
             context_block = f"Claim: {claim.raw_text}\n"
@@ -559,22 +557,36 @@ async def ask_question(request: AskRequest, db: Session = Depends(get_db)):
             f"Please answer the question based solely on the verified claims above."
         )
         
-        response = litellm.completion(
-            model=model,
-            messages=[
+        # Prepare request arguments
+        kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message}
             ],
-            max_tokens=1024,
-            temperature=0.2,
-        )
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "timeout": 300,  # 300s (5min) to match other Ollama operations text generation
+        }
+
+        # Inject Ollama configuration if needed
+        if "ollama" in model:
+            validate_ollama_config()
+            kwargs["api_base"] = OLLAMA_BASE_URL
+            kwargs["api_key"] = OLLAMA_API_KEY
+
+        response = litellm.completion(**kwargs)
         
-        answer = response.choices[0].message.content.strip()
+        # Access the content (works with both object and dict response types)
+        if hasattr(response.choices[0], 'message'):
+            answer = response.choices[0].message.content.strip()
+        else:
+            answer = response['choices'][0]['message']['content'].strip()
         
         return {
             "answer": answer,
-            "claim_ids": claim_ids_used,
-            "num_claims_used": len(claim_ids_used)
+            "claim_texts": [c.raw_text for c, _ in unique_matches],
+            "num_claims_used": len(unique_matches)
         }
     
     except Exception as e:
