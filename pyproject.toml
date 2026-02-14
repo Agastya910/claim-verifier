@@ -1,0 +1,31 @@
+[project]
+name = "claim-verifier"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "anthropic>=0.79.0",
+    "datasets>=4.5.0",
+    "docling>=2.73.0",
+    "edgartools>=5.15.2",
+    "fastapi[standard]>=0.128.8",
+    "fastembed>=0.7.4",
+    "finnhub-python>=2.4.27",
+    "gliner>=0.2.25",
+    "groq>=1.0.0",
+    "httpx>=0.28.1",
+    "litellm>=1.81.10",
+    "openai>=2.20.0",
+    "pandas>=2.3.3",
+    "pgvector>=0.4.2",
+    "plotly>=6.5.2",
+    "psycopg[binary]>=3.3.2",
+    "pydantic>=2.12.5",
+    "pytest>=9.0.2",
+    "python-dotenv>=1.2.1",
+    "sentence-transformers>=5.2.2",
+    "sqlalchemy>=2.0.46",
+    "streamlit>=1.54.0",
+    "uvicorn>=0.40.0",
+]
