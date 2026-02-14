@@ -15,7 +15,7 @@ from src.db.schema import ClaimRecord, VerdictRecord, TranscriptRecord, Financia
 from src.models import Claim, Verdict, VerificationResult
 from src.data_ingest.transcripts import fetch_transcript
 from src.data_ingest.financials import fetch_financial_statements
-from src.rag.indexer import index_company
+# from src.rag.indexer import index_company  # Not needed for production (data pre-indexed)
 from src.claim_extraction.pipeline import extract_all_claims
 from src.verifier.pipeline import verify_company, verify_all_companies
 from src.config import COMPANIES, QUARTERS_TUPLES
@@ -163,27 +163,8 @@ def update_job_status(job_id: str, status: str, progress: float, message: str = 
 
 # Background task functions
 def run_ingest(job_id: str, ticker: str, quarters: List[List[int]]):
-    update_job_status(job_id, "RUNNING", 0.1, f"Starting ingestion for {ticker}")
-    db = SessionLocal()
-    try:
-        financials = fetch_financial_statements(ticker, n_quarters=len(quarters) + 1)
-        update_job_status(job_id, "RUNNING", 0.4, f"Financials fetched for {ticker}")
-        
-        transcripts = []
-        total_q = len(quarters)
-        for i, (year, q) in enumerate(quarters):
-            transcript = fetch_transcript(ticker, year, q, db=db)
-            if transcript:
-                transcripts.append(transcript)
-            update_job_status(job_id, "RUNNING", 0.4 + (0.3 * (i+1)/total_q), f"Fetched transcript {year}Q{q}")
-        
-        index_company(ticker, transcripts, financials, db=db)
-        update_job_status(job_id, "COMPLETED", 1.0, f"Ingestion and indexing complete for {ticker}")
-    except Exception as e:
-        logger.error(f"Background: Ingestion failed for {ticker}: {e}")
-        update_job_status(job_id, "FAILED", 1.0, f"Error: {str(e)}")
-    finally:
-        db.close()
+    # DISABLED - data pre-indexed
+    pass
 
 def run_extraction(job_id: str, ticker: str, year: int, quarter: int):
     update_job_status(job_id, "RUNNING", 0.1, f"Starting extraction for {ticker} {year}Q{quarter}")
@@ -238,12 +219,14 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
 
 @app.post("/api/ingest")
 async def ingest_data(request: IngestRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    job_id = str(uuid.uuid4())
-    job = JobRecord(id=job_id, status="PENDING", message=f"Queued ingestion for {request.ticker.upper()}")
-    db.add(job)
-    db.commit()
-    background_tasks.add_task(run_ingest, job_id, request.ticker.upper(), request.quarters)
-    return {"message": "Ingestion triggered", "job_id": job_id, "ticker": request.ticker.upper()}
+    """
+    Ingestion endpoint - DISABLED in production.
+    All data has been pre-indexed. Use this only in development.
+    """
+    return {
+        "message": "Ingestion is disabled in production. All data is pre-indexed.",
+        "ticker": request.ticker.upper()
+    }
 
 @app.post("/api/extract-claims")
 async def extract_claims_endpoint(request: ExtractRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
