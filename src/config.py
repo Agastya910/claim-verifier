@@ -7,9 +7,25 @@ load_dotenv()
 # Database
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://app:password@localhost:5432/claimverifier")
 
+# Ollama Configuration
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud")
+
+# Validation function to be called by consumers
+def validate_ollama_config():
+    missing = []
+    if not OLLAMA_BASE_URL:
+        missing.append("OLLAMA_BASE_URL")
+    if not OLLAMA_API_KEY:
+        missing.append("OLLAMA_API_KEY")
+    
+    if missing:
+        raise ValueError(f"Missing required Ollama configuration: {', '.join(missing)}. Please set these in your .env file.")
+
 # Model Configurations
 MODEL_CONFIGS = {
-    "default": "ollama_chat/deepseek-v3.1:671b-cloud", # Use DeepSeek-V3.1 via Ollama
+    "default": f"ollama_chat/{OLLAMA_MODEL}", # Use configurable model via Ollama
         "groq_backup": "groq/llama-3.3-70b-versatile",
         "premium_claude": "anthropic/claude-3-5-sonnet-20240620",
         "premium_openai": "openai/gpt-4o",

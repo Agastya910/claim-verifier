@@ -5,7 +5,7 @@ import uuid
 import litellm
 from typing import List, Optional
 from src.models import Claim
-from src.config import MODEL_CONFIGS
+from src.config import MODEL_CONFIGS, OLLAMA_BASE_URL, OLLAMA_API_KEY, validate_ollama_config
 
 logger = logging.getLogger(__name__)
 
@@ -14,15 +14,14 @@ def get_litellm_model_string(tier: str) -> str:
     Maps configuration tiers to LiteLLM model strings.
     """
     mapping = {
-        "default": "ollama_chat/deepseek-v3.1:671b-cloud", # Use DeepSeek-V3.1 via Ollama
         "groq_backup": "groq/llama-3.3-70b-versatile",
         "premium_claude": "anthropic/claude-3-5-sonnet-20240620",
         "premium_openai": "openai/gpt-4o",
         "local_qwq": "ollama/qwq:32b",
         "local_small": "ollama/deepseek-r1:7b"
     }
-    # Fallback to MODEL_CONFIGS if tier exists there, otherwise use mapping or default
-    return mapping.get(tier, MODEL_CONFIGS.get(tier, mapping["default"]))
+    # Check MODEL_CONFIGS first for dynamic values (like default), then fallback to mapping
+    return MODEL_CONFIGS.get(tier, mapping.get(tier, MODEL_CONFIGS["default"]))
 
 def _clean_json_response(response_text: str) -> list:
     """
@@ -105,6 +104,11 @@ def extract_claims_llm(
         return []
 
     model_string = get_litellm_model_string(model_tier)
+    
+    # Fail fast if config is missing for Ollama
+    if "ollama" in model_string:
+         validate_ollama_config()
+
     batches = _batch_sentences(sentences, max_tokens=1800)  # Balanced for context and speed
     all_claims = []
 
@@ -157,13 +161,18 @@ Do NOT include qualitative statements without numbers.
         for attempt in range(retries):
             try:
                 # 1. Try the request
-                response = litellm.completion(
-                    model=model_string,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.0,  # Set to 0.0 for maximum factual accuracy
-                    api_base="http://127.0.0.1:11434",  # Ollama endpoint
-                    timeout=300  # 5-minute timeout for large model processing
-                )
+                kwargs = {
+                    "model": model_string,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "timeout": 300
+                }
+
+                if "ollama" in model_string:
+                    kwargs["api_base"] = OLLAMA_BASE_URL
+                    kwargs["api_key"] = OLLAMA_API_KEY
+
+                response = litellm.completion(**kwargs)
                 
                 content = response.choices[0].message.content
                 raw_claims = _clean_json_response(content)

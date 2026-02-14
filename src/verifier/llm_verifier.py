@@ -5,8 +5,7 @@ from typing import Optional
 
 import litellm
 from sqlalchemy.orm import Session
-
-from src.config import MODEL_CONFIGS
+from src.config import MODEL_CONFIGS, OLLAMA_BASE_URL, OLLAMA_API_KEY, validate_ollama_config
 from src.data_ingest.storage import save_verdicts
 from src.models import Claim, Verdict
 
@@ -18,14 +17,13 @@ def get_litellm_model_string(tier: str) -> str:
     Same as in llm_extractor.py to ensure consistency.
     """
     mapping = {
-        "default": "ollama_chat/deepseek-v3.1:671b-cloud", # Use DeepSeek-V3.1 via Ollama
         "groq_backup": "groq/llama-3.3-70b-versatile",
         "premium_claude": "anthropic/claude-3-5-sonnet-20240620",
         "premium_openai": "openai/gpt-4o",
         "local_qwq": "ollama/qwq:32b",
         "local_small": "ollama/deepseek-r1:7b"
     }
-    return mapping.get(tier, MODEL_CONFIGS.get(tier, mapping["default"]))
+    return MODEL_CONFIGS.get(tier, mapping.get(tier, MODEL_CONFIGS["default"]))
 
 def verify_with_llm(claim: Claim, context: str, db_session: Session, model_tier: str = "default") -> Verdict:
     """
@@ -34,6 +32,10 @@ def verify_with_llm(claim: Claim, context: str, db_session: Session, model_tier:
     Uses same configuration as extraction (Ollama) for consistency.
     """
     model_string = get_litellm_model_string(model_tier)
+    
+    # Fail fast if config is missing for Ollama
+    if "ollama" in model_string:
+         validate_ollama_config()
     
     prompt = f"""
     You are a senior financial analyst verifying earnings call claims against official financial data.
@@ -88,13 +90,18 @@ def verify_with_llm(claim: Claim, context: str, db_session: Session, model_tier:
         try:
             logger.info(f"LLM Verification attempt {attempt + 1} for claim {claim.id} using {model_string}")
             
-            response = litellm.completion(
-                model=model_string,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                api_base="http://127.0.0.1:11434",
-                timeout=300
-            )
+            kwargs = {
+                "model": model_string,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "timeout": 300
+            }
+
+            if "ollama" in model_string:
+                kwargs["api_base"] = OLLAMA_BASE_URL
+                kwargs["api_key"] = OLLAMA_API_KEY
+
+            response = litellm.completion(**kwargs)
 
             content = response.choices[0].message.content
             # Clean up potential markdown blocks if LLM didn't strictly follow JSON-only instruction
