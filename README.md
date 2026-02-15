@@ -83,6 +83,13 @@ The system is deployed as a single service on **Streamlit Cloud** connected to a
 
 ## Future Improvements
 
+- **Fully Automated Ingestion Pipeline**: Allow users to submit arbitrary company tickers and date ranges to trigger a complete end-to-end analysis (transcript fetching, SEC filing retrieval, claim extraction, and verification) without manual intervention. Workers already implemented, not deployed in production due to infra limitations.
+
+- **Comprehensive Benchmarking**: Verify system performance across standard financial datasets (e.g., Fin-Fact) using metrics:
+  - **Claim Extraction**: Precision, Recall, and F1-score to measure identification of quantitative claims.
+  - **RAG Retrieval**: nDCG@10 and Mean Reciprocal Rank (MRR) to assess evidence retrieval quality.
+  - **Verification Accuracy**: Rate of correct verdicts (Supported/Refuted) compared to human auditor ground truth.
+  - **Hallucination Rate**: Frequency of generated numbers not present in source text.
 - **Global Coverage**: Expand beyond US SEC-filing companies.
 - **Multimodal Verification**: Incorporate slide deck (PDF/Image) parsing into the verification pipeline.
 - **Advanced Reranking**: Fine-tune cross-encoders specifically on financial claim pairs.
