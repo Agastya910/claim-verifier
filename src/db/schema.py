@@ -2,7 +2,15 @@ import enum
 from datetime import datetime
 from typing import List, Optional
 
-from pgvector.sqlalchemy import Vector, SPARSEVEC
+try:
+    from pgvector.sqlalchemy import Vector, SPARSEVEC
+    _HAS_PGVECTOR = True
+except ImportError:
+    # pgvector not installed (e.g. on Streamlit Cloud) — use placeholder types.
+    # DocumentChunk table won't be usable, but the rest of the schema works fine.
+    _HAS_PGVECTOR = False
+    Vector = lambda dim: Text  # noqa: E731
+    SPARSEVEC = lambda dim: Text  # noqa: E731
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -65,7 +73,7 @@ class DocumentChunk(Base):
     sequence_index = Column(Integer, index=True)
     is_analyst_question = Column(Boolean, default=False)
     
-    # pgvector columns
+    # pgvector columns (placeholder types when pgvector is not installed)
     dense_embedding = Column(Vector(1024))      # 1024 dimensions for dense
     sparse_embedding = Column(SPARSEVEC(30522))  # 30522 for SPLADE
     
