@@ -426,13 +426,13 @@ class AskRequest(BaseModel):
 @app.post("/api/ask")
 async def ask_question(request: AskRequest, db: Session = Depends(get_db)):
     """
-    Answer a natural-language question about a company using ONLY the existing
-    verified claims stored in the database. Uses lightweight keyword-based search
-    on claims and verdicts. Does NOT use embeddings, pgvector, or RAG.
+    Answer a natural-language question about a company using smart retrieval
+    over existing verified claims. Uses intent detection, query decomposition,
+    multi-signal scoring, and intent-specific LLM prompts.
     """
     from src.config import MODEL_CONFIGS, ACTIVE_MODEL_TIER, OLLAMA_BASE_URL, OLLAMA_API_KEY, validate_ollama_config
+    from src.rag.smart_retrieval import retrieve_claims
     import litellm
-    import re
 
     ticker = request.ticker.upper()
     question = request.question.strip()
@@ -440,107 +440,47 @@ async def ask_question(request: AskRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     try:
-        # Extract keywords from the question (simple tokenization)
-        # Remove common stop words and extract meaningful terms
-        stop_words = {'the', 'a', 'an', 'is', 'was', 'were', 'are', 'be', 'been', 'being',
-                      'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should',
-                      'could', 'may', 'might', 'must', 'can', 'about', 'in', 'on', 'at',
-                      'to', 'for', 'of', 'with', 'by', 'from', 'up', 'down', 'out', 'off',
-                      'over', 'under', 'again', 'further', 'then', 'once'}
-        
-        # Tokenize and filter keywords
-        words = re.findall(r'\b\w+\b', question.lower())
-        keywords = [w for w in words if w not in stop_words and len(w) > 2]
-        
-        # Query claims with keyword-based search
-        # Join claims with verdicts to get verification reasoning and evidence
-        query = db.query(ClaimRecord, VerdictRecord).join(
-            VerdictRecord, ClaimRecord.id == VerdictRecord.claim_id, isouter=True
-        ).filter(ClaimRecord.ticker == ticker)
-        
-        # If we have keywords, perform ILIKE search
-        matched_claims = []
-        if keywords:
-            for keyword in keywords[:5]:  # Limit to top 5 keywords to avoid overly complex queries
-                keyword_pattern = f"%{keyword}%"
-                keyword_query = query.filter(
-                    (ClaimRecord.raw_text.ilike(keyword_pattern)) |
-                    (ClaimRecord.metric.ilike(keyword_pattern)) |
-                    (VerdictRecord.explanation.ilike(keyword_pattern)) |
-                    (func.cast(VerdictRecord.evidence, String).ilike(keyword_pattern))
-                )
-                matched_claims.extend(keyword_query.all())
-        
-        # Remove duplicates while preserving order
-        seen_texts = set()
-        unique_matches = []
-        for claim, verdict in matched_claims:
-            if claim.raw_text not in seen_texts:
-                seen_texts.add(claim.raw_text)
-                unique_matches.append((claim, verdict))
-        
-        # If no keyword matches, fallback to most recent claims
-        if not unique_matches:
-            logger.info(f"No keyword matches for {ticker}, falling back to recent claims")
-            unique_matches = query.order_by(
-                ClaimRecord.year.desc(),
-                ClaimRecord.quarter.desc()
-            ).limit(10).all()
-        else:
-            # Sort matches by most recent quarter first
-            unique_matches.sort(key=lambda x: (x[0].year, x[0].quarter), reverse=True)
-            unique_matches = unique_matches[:10]  # Limit to top 10
-        
-        if not unique_matches:
+        # Smart retrieval: intent detection + scoring + ranking
+        result = retrieve_claims(db, ticker, question)
+
+        if not result.claims:
             return {
                 "answer": f"No verified claims found for {ticker}. Please make sure the company has been analyzed.",
                 "claim_texts": [],
             }
-        
+
         # Build structured context from retrieved claims
         context_blocks = []
-        
-        for claim, verdict in unique_matches:
-            
-            # Build structured context block
-            context_block = f"Claim: {claim.raw_text}\n"
-            context_block += f"Metric: {claim.metric} = {claim.value} {claim.unit or ''}\n"
-            context_block += f"Quarter: {claim.year} Q{claim.quarter}\n"
-            context_block += f"Speaker: {claim.speaker}\n"
-            
+        for claim, verdict in result.claims:
+            block = f"Claim: {claim.raw_text}\n"
+            block += f"Metric: {claim.metric} = {claim.value} {claim.unit or ''}\n"
+            block += f"Quarter: {claim.year} Q{claim.quarter}\n"
+            block += f"Speaker: {claim.speaker}\n"
             if verdict:
-                context_block += f"Verdict: {verdict.verdict}\n"
-                context_block += f"Reasoning: {verdict.explanation}\n"
-                
+                block += f"Verdict: {verdict.verdict}\n"
+                block += f"Reasoning: {verdict.explanation}\n"
                 if verdict.evidence:
                     evidence_list = verdict.evidence if isinstance(verdict.evidence, list) else []
                     if evidence_list:
-                        context_block += f"Evidence: {'; '.join(evidence_list)}\n"
+                        block += f"Evidence: {'; '.join(evidence_list)}\n"
             else:
-                context_block += "Verdict: NOT YET VERIFIED\n"
-            
-            context_blocks.append(context_block)
-        
+                block += "Verdict: NOT YET VERIFIED\n"
+            context_blocks.append(block)
+
         context_str = "\n---\n\n".join(context_blocks)
-        
-        # Send to LLM with strict system instruction
-        model = MODEL_CONFIGS.get(ACTIVE_MODEL_TIER, MODEL_CONFIGS["default"])
-        
-        system_message = (
-            "You are a financial analysis assistant. Answer the user's question using ONLY "
-            "the provided verified claims and evidence. If the answer cannot be derived from "
-            "the provided context, say 'The available verified claims do not contain enough "
-            "information to answer this question.' Do not fabricate data."
-        )
-        
+
+        # Use intent-specific system prompt from smart retrieval
+        system_message = result.system_prompt_hint
         user_message = (
             f"Company: {ticker}\n\n"
             f"Question: {question}\n\n"
-            f"--- VERIFIED CLAIMS ---\n{context_str}\n--- END VERIFIED CLAIMS ---\n\n"
+            f"--- VERIFIED CLAIMS ({len(result.claims)} retrieved, intent: {result.intent}) ---\n"
+            f"{context_str}\n--- END VERIFIED CLAIMS ---\n\n"
             f"Please answer the question based solely on the verified claims above."
         )
-        
-        # Prepare request arguments
+
+        # Prepare LLM request
+        model = MODEL_CONFIGS.get(ACTIVE_MODEL_TIER, MODEL_CONFIGS["default"])
         kwargs = {
             "model": model,
             "messages": [
@@ -549,29 +489,29 @@ async def ask_question(request: AskRequest, db: Session = Depends(get_db)):
             ],
             "max_tokens": 1024,
             "temperature": 0.2,
-            "timeout": 300,  # 300s (5min) to match other Ollama operations text generation
+            "timeout": 300,
         }
 
-        # Inject Ollama configuration if needed
         if "ollama" in model:
             validate_ollama_config()
             kwargs["api_base"] = OLLAMA_BASE_URL
             kwargs["api_key"] = OLLAMA_API_KEY
 
         response = litellm.completion(**kwargs)
-        
-        # Access the content (works with both object and dict response types)
+
         if hasattr(response.choices[0], 'message'):
             answer = response.choices[0].message.content.strip()
         else:
             answer = response['choices'][0]['message']['content'].strip()
-        
+
         return {
             "answer": answer,
-            "claim_texts": [c.raw_text for c, _ in unique_matches],
-            "num_claims_used": len(unique_matches)
+            "claim_texts": [c.raw_text for c, _ in result.claims],
+            "num_claims_used": len(result.claims),
+            "intent": result.intent,
+            "filters": result.filters_applied,
         }
-    
+
     except Exception as e:
         logger.error(f"Error answering question for {ticker}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to answer question: {str(e)}")
