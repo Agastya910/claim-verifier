@@ -1,0 +1,7 @@
+streamlit>=1.54.0
+sqlalchemy>=2.0.46
+psycopg[binary]>=3.3.2
+pandas>=2.3.3
+plotly>=6.5.2
+litellm>=1.81.10
+python-dotenv>=1.2.1

@@ -32,6 +32,7 @@ python/
 .env
 .env.local
 .env.*.local
+.streamlit/secrets.toml
 
 # Testing and Coverage
 .pytest_cache/

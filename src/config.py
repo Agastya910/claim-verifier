@@ -4,13 +4,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _get_secret(key: str, default: str = "") -> str:
+    """Try st.secrets first (Streamlit Cloud), then os.environ / .env (local dev)."""
+    try:
+        import streamlit as st
+        val = st.secrets.get(key, None)
+        if val is not None:
+            return str(val)
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+
 # Database
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://app:password@localhost:5432/claimverifier")
+DATABASE_URL = _get_secret("DATABASE_URL", "postgresql+psycopg://app:password@localhost:5432/claimverifier")
 
 # Ollama Configuration
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud")
+OLLAMA_BASE_URL = _get_secret("OLLAMA_BASE_URL")
+OLLAMA_API_KEY = _get_secret("OLLAMA_API_KEY")
+OLLAMA_MODEL = _get_secret("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud")
 
 # Validation function to be called by consumers
 def validate_ollama_config():
@@ -65,14 +78,14 @@ FINANCIAL_ENTITY_TYPES = [
     "non-GAAP indicator"
 ]
 
-# API Keys (loaded via dotenv)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-SEC_IDENTITY_EMAIL = os.getenv("SEC_IDENTITY_EMAIL")
+# API Keys (loaded via st.secrets → os.environ → .env)
+GROQ_API_KEY = _get_secret("GROQ_API_KEY")
+ANTHROPIC_API_KEY = _get_secret("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = _get_secret("OPENAI_API_KEY")
+FINNHUB_API_KEY = _get_secret("FINNHUB_API_KEY")
+SEC_IDENTITY_EMAIL = _get_secret("SEC_IDENTITY_EMAIL")
 
-ACTIVE_MODEL_TIER = os.getenv("ACTIVE_MODEL_TIER", "default")
+ACTIVE_MODEL_TIER = _get_secret("ACTIVE_MODEL_TIER", "default")
 
 # Data Protection
 # CRITICAL: This flag controls whether destructive database operations are allowed.

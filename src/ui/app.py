@@ -1,12 +1,27 @@
+import sys
+import os
+# Ensure repo root is on sys.path so `src.*` imports work when running via `streamlit run`
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 import streamlit as st
-import httpx
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import os
+import logging
+import re
 
-# Configuration
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+from sqlalchemy import create_engine, select, distinct, func, String
+from sqlalchemy.orm import Session, sessionmaker
+
+from src.config import (
+    DATABASE_URL, MODEL_CONFIGS, ACTIVE_MODEL_TIER, COMPANIES,
+    OLLAMA_BASE_URL, OLLAMA_API_KEY, validate_ollama_config,
+)
+from src.db.schema import ClaimRecord, VerdictRecord, TranscriptRecord, FinancialData
+
+logger = logging.getLogger(__name__)
+
+# ─── Configuration ──────────────────────────────────────────────────────
 VERDICT_COLORS = {
     "VERIFIED": "#22c55e",
     "APPROXIMATELY_TRUE": "#86efac",
@@ -28,6 +43,321 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+
+# ─── Database Connection (cached — created once per Streamlit process) ──
+@st.cache_resource
+def get_engine():
+    return create_engine(DATABASE_URL)
+
+def get_session():
+    engine = get_engine()
+    return sessionmaker(bind=engine)()
+
+
+# ─── Data Access Functions (replace httpx API calls) ────────────────────
+
+def check_health():
+    """Check database connectivity."""
+    try:
+        with Session(get_engine()) as db:
+            db.execute(select(1))
+        return {"status": "healthy"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {"status": "unhealthy"}
+
+
+def list_companies():
+    """Get unique tickers from transcripts + financial_data."""
+    try:
+        with Session(get_engine()) as db:
+            t_tickers = db.execute(select(distinct(TranscriptRecord.ticker))).scalars().all()
+            f_tickers = db.execute(select(distinct(FinancialData.ticker))).scalars().all()
+            return sorted(list(set(t_tickers) | set(f_tickers)))
+    except Exception:
+        return []
+
+
+def get_results(ticker):
+    """Get all claims and verdicts for a company."""
+    ticker = ticker.upper()
+    try:
+        with Session(get_engine()) as db:
+            claims = db.query(ClaimRecord).filter(ClaimRecord.ticker == ticker).all()
+            verdicts = db.query(VerdictRecord).join(ClaimRecord).filter(ClaimRecord.ticker == ticker).all()
+
+            # Serialize to dicts (detach from session)
+            claims_list = []
+            for c in claims:
+                claims_list.append({
+                    "id": c.id, "ticker": c.ticker, "quarter": c.quarter, "year": c.year,
+                    "speaker": c.speaker, "metric": c.metric, "value": c.value, "unit": c.unit,
+                    "period": c.period, "is_gaap": c.is_gaap, "is_forward_looking": c.is_forward_looking,
+                    "hedging_language": c.hedging_language, "raw_text": c.raw_text,
+                    "extraction_method": c.extraction_method, "confidence": c.confidence,
+                    "context": c.context,
+                })
+            verdicts_list = []
+            for v in verdicts:
+                verdicts_list.append({
+                    "id": v.id, "claim_id": v.claim_id, "verdict": v.verdict,
+                    "actual_value": v.actual_value, "claimed_value": v.claimed_value,
+                    "difference": v.difference, "explanation": v.explanation,
+                    "misleading_flags": v.misleading_flags, "confidence": v.confidence,
+                    "data_sources": v.data_sources, "evidence": v.evidence,
+                })
+            return {
+                "ticker": ticker,
+                "total_claims": len(claims_list),
+                "claims": claims_list,
+                "verdicts": verdicts_list,
+            }
+    except Exception as e:
+        logger.error(f"Error retrieving results for {ticker}: {e}")
+        return None
+
+
+def get_dashboard():
+    """Aggregate dashboard data across all companies."""
+    try:
+        with Session(get_engine()) as db:
+            all_tickers = db.execute(select(distinct(ClaimRecord.ticker))).scalars().all()
+            if not all_tickers:
+                return {"has_precomputed_data": False, "companies": [], "totals": {}}
+
+            dashboard = {
+                "companies": [],
+                "totals": {"claims": 0, "verified": 0, "false": 0, "misleading": 0, "unverifiable": 0, "approx_true": 0},
+                "target_companies": COMPANIES,
+                "has_precomputed_data": True,
+            }
+
+            for ticker in sorted(all_tickers):
+                claims = db.query(ClaimRecord).filter(ClaimRecord.ticker == ticker).all()
+                claim_ids = [c.id for c in claims]
+                verdicts = db.query(VerdictRecord).filter(VerdictRecord.claim_id.in_(claim_ids)).all() if claim_ids else []
+
+                v_counts = {}
+                for v in verdicts:
+                    v_counts[v.verdict] = v_counts.get(v.verdict, 0) + 1
+
+                company_data = {
+                    "ticker": ticker,
+                    "total_claims": len(claims),
+                    "total_verdicts": len(verdicts),
+                    "verified": v_counts.get("VERIFIED", 0),
+                    "false": v_counts.get("FALSE", 0),
+                    "misleading": v_counts.get("MISLEADING", 0),
+                    "approx_true": v_counts.get("APPROXIMATELY_TRUE", 0),
+                    "unverifiable": v_counts.get("UNVERIFIABLE", 0),
+                }
+                dashboard["companies"].append(company_data)
+                dashboard["totals"]["claims"] += len(claims)
+                dashboard["totals"]["verified"] += company_data["verified"]
+                dashboard["totals"]["false"] += company_data["false"]
+                dashboard["totals"]["misleading"] += company_data["misleading"]
+                dashboard["totals"]["unverifiable"] += company_data["unverifiable"]
+                dashboard["totals"]["approx_true"] += company_data["approx_true"]
+
+            return dashboard
+    except Exception as e:
+        logger.error(f"Error building dashboard: {e}")
+        return {"has_precomputed_data": False}
+
+
+def get_quarters(ticker):
+    """Get available (year, quarter) pairs for a company."""
+    ticker = ticker.upper()
+    try:
+        with Session(get_engine()) as db:
+            trans_rows = db.execute(
+                select(TranscriptRecord.year, TranscriptRecord.quarter)
+                .where(TranscriptRecord.ticker == ticker)
+            ).all()
+            fin_rows = db.execute(
+                select(FinancialData.year, FinancialData.quarter)
+                .where(FinancialData.ticker == ticker)
+            ).all()
+            all_q = set()
+            for y, q in trans_rows + fin_rows:
+                all_q.add((y, q))
+            result = [{"year": y, "quarter": q} for y, q in sorted(list(all_q), reverse=True)]
+            return {"available_quarters": result}
+    except Exception:
+        return {"available_quarters": []}
+
+
+def get_transcript(ticker, year, quarter):
+    """Get raw transcript data."""
+    try:
+        with Session(get_engine()) as db:
+            rec = db.query(TranscriptRecord).filter(
+                TranscriptRecord.ticker == ticker.upper(),
+                TranscriptRecord.year == year,
+                TranscriptRecord.quarter == quarter,
+            ).first()
+            if not rec:
+                return None
+            return {
+                "source": rec.source, "date": str(rec.date) if rec.date else None,
+                "segments": rec.segments or [],
+            }
+    except Exception:
+        return None
+
+
+def get_financials(ticker, year, quarter):
+    """Get raw financial data."""
+    try:
+        with Session(get_engine()) as db:
+            recs = db.query(FinancialData).filter(
+                FinancialData.ticker == ticker.upper(),
+                FinancialData.year == year,
+                FinancialData.quarter == quarter,
+            ).all()
+            if not recs:
+                return None
+            return [
+                {"metric": r.metric, "value": r.value, "unit": r.unit,
+                 "is_gaap": r.is_gaap, "source": r.source}
+                for r in recs
+            ]
+    except Exception:
+        return None
+
+
+def ask_question(ticker, question):
+    """
+    Answer a question about a company using keyword search over verified claims + LLM.
+    Replaces the /api/ask endpoint.
+    """
+    import litellm
+
+    ticker = ticker.upper()
+    question = question.strip()
+    if not question:
+        return {"answer": "Please enter a question.", "claim_texts": []}
+
+    try:
+        stop_words = {'the', 'a', 'an', 'is', 'was', 'were', 'are', 'be', 'been', 'being',
+                      'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'should',
+                      'could', 'may', 'might', 'must', 'can', 'about', 'in', 'on', 'at',
+                      'to', 'for', 'of', 'with', 'by', 'from', 'up', 'down', 'out', 'off',
+                      'over', 'under', 'again', 'further', 'then', 'once'}
+
+        words = re.findall(r'\b\w+\b', question.lower())
+        keywords = [w for w in words if w not in stop_words and len(w) > 2]
+
+        with Session(get_engine()) as db:
+            query = db.query(ClaimRecord, VerdictRecord).join(
+                VerdictRecord, ClaimRecord.id == VerdictRecord.claim_id, isouter=True
+            ).filter(ClaimRecord.ticker == ticker)
+
+            matched_claims = []
+            if keywords:
+                for keyword in keywords[:5]:
+                    kp = f"%{keyword}%"
+                    kq = query.filter(
+                        (ClaimRecord.raw_text.ilike(kp)) |
+                        (ClaimRecord.metric.ilike(kp)) |
+                        (VerdictRecord.explanation.ilike(kp)) |
+                        (func.cast(VerdictRecord.evidence, String).ilike(kp))
+                    )
+                    matched_claims.extend(kq.all())
+
+            seen_texts = set()
+            unique_matches = []
+            for claim, verdict in matched_claims:
+                if claim.raw_text not in seen_texts:
+                    seen_texts.add(claim.raw_text)
+                    unique_matches.append((claim, verdict))
+
+            if not unique_matches:
+                unique_matches = query.order_by(
+                    ClaimRecord.year.desc(), ClaimRecord.quarter.desc()
+                ).limit(10).all()
+            else:
+                unique_matches.sort(key=lambda x: (x[0].year, x[0].quarter), reverse=True)
+                unique_matches = unique_matches[:10]
+
+            if not unique_matches:
+                return {
+                    "answer": f"No verified claims found for {ticker}. Please make sure the company has been analyzed.",
+                    "claim_texts": [],
+                }
+
+            # Build context blocks
+            context_blocks = []
+            claim_texts_out = []
+            for claim, verdict in unique_matches:
+                claim_texts_out.append(claim.raw_text)
+                block = f"Claim: {claim.raw_text}\n"
+                block += f"Metric: {claim.metric} = {claim.value} {claim.unit or ''}\n"
+                block += f"Quarter: {claim.year} Q{claim.quarter}\n"
+                block += f"Speaker: {claim.speaker}\n"
+                if verdict:
+                    block += f"Verdict: {verdict.verdict}\n"
+                    block += f"Reasoning: {verdict.explanation}\n"
+                    if verdict.evidence:
+                        ev_list = verdict.evidence if isinstance(verdict.evidence, list) else []
+                        if ev_list:
+                            block += f"Evidence: {'; '.join(ev_list)}\n"
+                else:
+                    block += "Verdict: NOT YET VERIFIED\n"
+                context_blocks.append(block)
+
+            context_str = "\n---\n\n".join(context_blocks)
+
+        # LLM call
+        model = MODEL_CONFIGS.get(ACTIVE_MODEL_TIER, MODEL_CONFIGS["default"])
+
+        system_message = (
+            "You are a financial analysis assistant. Answer the user's question using ONLY "
+            "the provided verified claims and evidence. If the answer cannot be derived from "
+            "the provided context, say 'The available verified claims do not contain enough "
+            "information to answer this question.' Do not fabricate data."
+        )
+        user_message = (
+            f"Company: {ticker}\n\n"
+            f"Question: {question}\n\n"
+            f"--- VERIFIED CLAIMS ---\n{context_str}\n--- END VERIFIED CLAIMS ---\n\n"
+            f"Please answer the question based solely on the verified claims above."
+        )
+
+        kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.2,
+            "timeout": 300,
+        }
+
+        if "ollama" in model:
+            validate_ollama_config()
+            kwargs["api_base"] = OLLAMA_BASE_URL
+            kwargs["api_key"] = OLLAMA_API_KEY
+
+        response = litellm.completion(**kwargs)
+
+        if hasattr(response.choices[0], 'message'):
+            answer = response.choices[0].message.content.strip()
+        else:
+            answer = response['choices'][0]['message']['content'].strip()
+
+        return {
+            "answer": answer,
+            "claim_texts": claim_texts_out,
+            "num_claims_used": len(unique_matches),
+        }
+
+    except Exception as e:
+        logger.error(f"Error answering question for {ticker}: {e}")
+        return {"answer": f"Failed to answer question: {str(e)}", "claim_texts": []}
+
 
 # ─── Premium CSS ────────────────────────────────────────────────────────
 st.markdown("""
@@ -85,10 +415,10 @@ st.markdown("""
 .hero-section p { color: #94a3b8; font-size: 1.1em; line-height: 1.6; }
 .hero-section .step-list { text-align: left; max-width: 500px; margin: 24px auto 0; }
 .hero-section .step { color: #c7d2fe; font-size: 0.95em; margin: 10px 0; }
-.hero-section .step-num { 
-    background: rgba(99, 102, 241, 0.3); 
-    border-radius: 50%; 
-    width: 28px; height: 28px; 
+.hero-section .step-num {
+    background: rgba(99, 102, 241, 0.3);
+    border-radius: 50%;
+    width: 28px; height: 28px;
     display: inline-flex; align-items: center; justify-content: center;
     margin-right: 12px; font-weight: 700; font-size: 0.85em; color: #a5b4fc;
 }
@@ -140,52 +470,22 @@ footer { visibility: hidden; }
 """, unsafe_allow_html=True)
 
 
-# ─── API Client ─────────────────────────────────────────────────────────
-class APIClient:
-    def __init__(self, base_url):
-        self.base_url = base_url
-
-    def get(self, endpoint):
-        try:
-            response = httpx.get(f"{self.base_url}{endpoint}", timeout=30.0)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code != 404:
-                st.error(f"API Error ({e.response.status_code}): {endpoint}")
-            return None
-        except Exception as e:
-            return None
-
-    def post(self, endpoint, data=None):
-        try:
-            response = httpx.post(f"{self.base_url}{endpoint}", json=data, timeout=120.0)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            st.error(f"API Error: {e}")
-            return None
-
-api = APIClient(BACKEND_URL)
-
-
 # ─── Sidebar ────────────────────────────────────────────────────────────
 st.sidebar.markdown("## 🔍 Claim Verifier")
 st.sidebar.caption("Earnings transcript verification system")
 st.sidebar.markdown("---")
 
 # System status
-health = api.get("/api/health")
+health = check_health()
 if health and health.get("status") == "healthy":
     st.sidebar.success("🟢 System Online")
 else:
-    st.sidebar.error("🔴 System Offline — start the backend")
+    st.sidebar.error("🔴 System Offline — check database connection")
 
 # ─── Section A: Companies ───────────────────────────────────────────────
 st.sidebar.subheader("🏢 Companies")
 
-companies_data = api.get("/api/companies")
-available_companies = companies_data.get("companies", []) if companies_data else []
+available_companies = list_companies()
 
 selected_tickers = st.sidebar.multiselect(
     "Select companies",
@@ -195,7 +495,6 @@ selected_tickers = st.sidebar.multiselect(
     key="company_select",
 )
 
-# Resolve effective selection
 active_tickers = selected_tickers
 
 # ─── Section B: Add New Company (Controlled Future Feature) ─────────────
@@ -208,7 +507,6 @@ with st.sidebar.expander("➕ Don't see a company? Add one.", expanded=False):
     )
 
     if new_company_name:
-        # Simulate ticker resolution (placeholder)
         resolved_ticker = new_company_name.strip().upper()[:4]
         st.info(f"🔎 Resolved ticker: **{resolved_ticker}**")
         st.caption("Please confirm this is the correct ticker before proceeding.")
@@ -265,12 +563,12 @@ with st.sidebar.expander("🔑 API Keys (Optional)", expanded=False):
 selected_results = []
 if active_tickers:
     for ticker in active_tickers:
-        res = api.get(f"/api/results/{ticker}")
+        res = get_results(ticker)
         if res and res.get("total_claims", 0) > 0:
             selected_results.append(res)
 
 # General dashboard data (used on landing page)
-dashboard_data = api.get("/api/dashboard")
+dashboard_data = get_dashboard()
 
 
 # ─── Main Content ───────────────────────────────────────────────────────
@@ -354,7 +652,7 @@ with tab1:
         for r in selected_results:
             all_verdicts.extend(r.get("verdicts", []))
             all_claims.extend(r.get("claims", []))
-        
+
         v_counts = pd.Series([v.get("verdict") for v in all_verdicts]).value_counts().to_dict() if all_verdicts else {}
 
         # Metric Cards
@@ -378,7 +676,7 @@ with tab1:
                 r_verdicts = r.get("verdicts", [])
                 for v in r_verdicts:
                     company_stats.append({"Company": ticker, "Verdict": v["verdict"], "Count": 1})
-            
+
             if company_stats:
                 df_stats = pd.DataFrame(company_stats).groupby(["Company", "Verdict"], as_index=False).sum()
                 fig_bar = px.bar(df_stats, x="Company", y="Count", color="Verdict",
@@ -440,9 +738,9 @@ with tab2:
             focus_ticker = st.selectbox("Focus on company", active_tickers, index=0)
         else:
             focus_ticker = active_tickers[0]
-        
+
         focus_res = next((r for r in selected_results if r["ticker"] == focus_ticker), None)
-        
+
         if focus_res:
             # ─── Search / Question Feature ──────────────────────────────
             st.markdown(f"#### 💬 Ask a question about {focus_ticker}")
@@ -455,10 +753,7 @@ with tab2:
 
             if question_input:
                 with st.spinner(f"Searching verified claims for {focus_ticker}…"):
-                    answer_resp = api.post("/api/ask", data={
-                        "ticker": focus_ticker,
-                        "question": question_input,
-                    })
+                    answer_resp = ask_question(focus_ticker, question_input)
                 if answer_resp:
                     st.markdown(
                         f'<div class="answer-container">'
@@ -467,12 +762,12 @@ with tab2:
                         f'</div>',
                         unsafe_allow_html=True,
                     )
-                    claim_ids = answer_resp.get("claim_ids", [])
+                    claim_texts = answer_resp.get("claim_texts", [])
                     num_claims = answer_resp.get("num_claims_used", 0)
-                    if claim_ids:
+                    if claim_texts:
                         with st.expander(f"📚 {num_claims} verified claim(s) used", expanded=False):
-                            for i, claim_id in enumerate(claim_ids):
-                                st.caption(f"{i+1}. Claim ID: {claim_id}")
+                            for i, ct in enumerate(claim_texts):
+                                st.caption(f"{i+1}. {ct}")
                 else:
                     st.error("Failed to get an answer. Please try again.")
 
@@ -581,7 +876,7 @@ with tab3:
         raw_ticker = st.selectbox("Company", available_companies if available_companies else ["—"], key="raw_ticker")
     with col_r2:
         if raw_ticker and raw_ticker != "—":
-            quarters_raw = api.get(f"/api/companies/{raw_ticker}/quarters")
+            quarters_raw = get_quarters(raw_ticker)
             if quarters_raw and quarters_raw.get("available_quarters"):
                 q_options = [f"{q['year']} Q{q['quarter']}" for q in quarters_raw["available_quarters"]]
                 selected_q = st.selectbox("Quarter", q_options)
@@ -598,7 +893,7 @@ with tab3:
         data_type = st.radio("Record Type", ["📝 Transcript", "📊 Financial Statements"], horizontal=True)
 
         if "Transcript" in data_type:
-            t_data = api.get(f"/api/transcripts/{raw_ticker}/{y_raw}/{q_raw}")
+            t_data = get_transcript(raw_ticker, y_raw, q_raw)
             if t_data:
                 st.caption(f"Source: {t_data.get('source', 'N/A')} | Date: {t_data.get('date', 'N/A')}")
                 st.markdown("---")
@@ -609,7 +904,7 @@ with tab3:
             else:
                 st.info("No transcript data available for this quarter.")
         else:
-            f_data = api.get(f"/api/financials/{raw_ticker}/{y_raw}/{q_raw}")
+            f_data = get_financials(raw_ticker, y_raw, q_raw)
             if f_data:
                 df_f = pd.DataFrame(f_data)
                 display_cols = [c for c in ["metric", "value", "unit", "is_gaap", "source"] if c in df_f.columns]
