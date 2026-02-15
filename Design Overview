@@ -4,39 +4,37 @@
 
 ## System Overview
 
-We propose a modular, cloud-scalable system that automates the entire pipeline: data ingestion, claim extraction, verification, and presentation. We leverage large language models (LLMs) with retrieval-augmented reasoning (RAG) for flexible claim interpretation, but ground their output in actual financial data through deterministic checks. Our architecture uses Python services (FastAPI for web interfaces) and containerization for cloud deployment. In practice, the system will fetch earnings transcripts and financial statements, parse them, extract any numeric claims (e.g. "revenue up 15% YoY"), and then compare each claim to the company's reported data. Discrepancies or overly "optimistic" framings will be flagged for review. This design draws on recent research and industry practice: analysts manually verify quantitative claims against official releases, and academic benchmarks like Fin-Fact and FINDVER highlight the challenge of automated financial claim verification. We replicate best-practices by combining direct numeric checks with LLM-based reasoning for nuance (e.g. non-GAAP adjustments) to maximize accuracy.
+- This is a modular, cloud-scalable system that automates the pipeline: data ingestion, claim extraction, verification, and presentation.
+
+- It leverages large language models (LLMs) with retrieval-augmented reasoning (RAG) for flexible claim interpretation, but grounds their output in actual financial data through deterministic checks. Our architecture uses Python services (FastAPI for web interfaces) and containerization for cloud deployment.
+
+- In practice, the system will fetch earnings transcripts and financial statements, parse them, extract any numeric claims (e.g. "revenue up 15% YoY"), and then compare each claim to the company's reported data. Discrepancies or overly "optimistic" framings will be flagged for review.
+
+- This design draws on recent research and industry practice: analysts manually verify quantitative claims against official releases, and academic benchmarks like Fin-Fact and FINDVER highlight the challenge of automated financial claim verification. I replicate best-practices by combining direct numeric checks with LLM-based reasoning for nuance (e.g. non-GAAP adjustments) to maximize accuracy.
 
 ---
 
 ## Data Pipeline and Sources
 
-### Transcripts — Finnhub API (Primary)
+### Transcripts — HuggingFace Dataset (Primary)
 
-We use the Finnhub Stock API as our primary transcript source. Finnhub provides earnings call transcripts that are speaker-segmented — each utterance is tagged with the speaker name and role (CEO, CFO, Analyst, etc.), which is critical for attributing claims to specific executives. The free tier allows 50 API calls per minute, more than sufficient for our 10 companies × 4 quarters = 40 transcript fetches. The transcripts include metadata (date, quarter, year, symbol) and structured dialogue segments.[1][2][3]
+For rapid development and testing, I use the `Bose345/sp500_earnings_transcripts` dataset on HuggingFace, which contains 33,362 transcripts across 685 S&P 500 companies from 2005–2025. Each record includes `symbol`, `company_name`, `year`, `quarter`, `date`, `content` (full raw text), and `structured_content` (array of `{speaker, text}` objects — already speaker-segmented). This allows preloading transcripts without any API calls during development.[4]
 
-### Transcripts — HuggingFace Dataset (Fallback)
+### Transcripts — Finnhub API (Secondary)
 
-As a fallback and for rapid development/testing, we use the `Bose345/sp500_earnings_transcripts` dataset on HuggingFace, which contains 33,362 transcripts across 685 S&P 500 companies from 2005–2025. Each record includes `symbol`, `company_name`, `year`, `quarter`, `date`, `content` (full raw text), and `structured_content` (array of `{speaker, text}` objects — already speaker-segmented). This allows preloading transcripts without any API calls during development.[4]
+I plan to use the Finnhub Stock API as our secondary transcript source during scaling. Finnhub provides earnings call transcripts that are speaker-segmented — each utterance is tagged with the speaker name and role (CEO, CFO, Analyst, etc.), which is critical for attributing claims to specific executives. The transcripts include metadata (date, quarter, year, symbol) and structured dialogue segments.[1][2][3]
 
 ### Financial Data — SEC EDGAR XBRL JSON API + edgartools (Primary)
 
-For structured financial data (revenue, net income, EPS, margins, etc.), we use the SEC EDGAR XBRL API — the official, authoritative, free, unlimited-access source of US public company financials. The SEC provides key endpoints:[5]
+For structured financial data (revenue, net income, EPS, margins, etc.), I use the SEC EDGAR XBRL API — the official, authoritative, free, unlimited-access source of US public company financials. The SEC provides key endpoints:[5]
 
 - **`data.sec.gov/api/xbrl/companyconcept/`** — All XBRL disclosures for a single company + concept (e.g., Revenue, NetIncome) as JSON[6][5]
 - **`data.sec.gov/api/xbrl/companyfacts/`** — All facts for a company in one JSON payload
 - **`data.sec.gov/submissions/`** — Filing metadata, CIK lookups
 
-To access this data ergonomically, we use the `edgartools` Python library:[7][8]
+To access this data ergonomically, I use the `edgartools` Python library:[7][8]
 
 - AI-native with built-in MCP server for LLM integration and optimized text extraction
-- 3 lines of code for full financial statements:
-  ```python
-  from edgar import Company
-  financials = Company("AAPL").get_financials()
-  income = financials.income_statement()
-  balance = financials.balance_sheet()
-  cashflow = financials.cashflow_statement()
-  ```
 - Multi-period analysis via `MultiFinancials` for comparing quarters side-by-side[8]
 - Returns pandas DataFrames for immediate computation
 - Parses XBRL natively, handles tag mapping automatically[9]
@@ -64,11 +62,11 @@ Finnhub's `company_basic_financials` endpoint provides ~30 quarterly metrics (EP
 
 ## Claim Extraction Pipeline
 
-We extract quantitative claims from transcript text using a multi-stage pipeline designed for high recall and precision on financial language.
+I extract quantitative claims from transcript text using a multi-stage pipeline designed for high recall and precision on financial language.
 
 ### Stage 1 — GLiNER Entity Pre-Filter
 
-The first pass uses GLiNER, a zero-shot Named Entity Recognition model that identifies custom entity types without any training data. GLiNER is a compact transformer encoder (<500M parameters) that runs on CPU, produces deterministic outputs with confidence scores, and outperforms ChatGPT on zero-shot NER benchmarks. We define custom financial entity types:[10][11][12][13]
+The first pass uses GLiNER, a zero-shot Named Entity Recognition model that identifies custom entity types without any training data. GLiNER is a compact transformer encoder (<500M parameters) that runs on CPU, produces deterministic outputs with confidence scores, and outperforms ChatGPT on zero-shot NER benchmarks. I define custom financial entity types:[10][11][12][13]
 
 - `REVENUE_CLAIM`, `INCOME_CLAIM`, `EPS_CLAIM`, `MARGIN_CLAIM`
 - `GROWTH_PERCENTAGE`, `ABSOLUTE_VALUE`, `COMPARISON_CLAIM`
@@ -84,9 +82,9 @@ This filters out ~70% of transcript content (qualitative discussion, greetings, 
 
 ### Stage 2 — LLM-Based Claim Extraction (Claimify-Inspired)
 
-For sentences flagged by GLiNER, we use an LLM-based extraction pipeline inspired by Microsoft's Claimify methodology (ACL 2025), which achieves 87.9% accuracy — the highest of any claim extraction method tested. The pipeline operates in three sub-stages:[15][16][17]
+For sentences flagged by GLiNER, I use an LLM-based extraction pipeline inspired by Microsoft's Claimify methodology (ACL 2025), which achieves 87.9% accuracy — the highest of any claim extraction method tested. The pipeline operates in three sub-stages:[15][16][17]
 
-**Selection**: The LLM identifies which sentences contain verifiable quantitative content vs. unverifiable opinions or forward-looking statements. Forward-looking claims ("we expect", "guidance", "outlook") are tagged but excluded from fact-checking.
+**Selection**: The LLM identifies which sentences contain verifiable quantitative content vs. unverifiable opinions or forward-looking statements. Forward-looking claims ("I expect", "guidance", "outlook") are tagged but excluded from fact-checking.
 
 **Disambiguation**: For sentences with ambiguity, the LLM resolves it using surrounding context. If ambiguity cannot be resolved, the claim is marked as ambiguous rather than guessed at.[15]
 
@@ -123,11 +121,11 @@ Each claim is stored as: `(id, ticker, quarter, year, speaker, metric, value, un
 
 ## Hybrid RAG Retrieval Pipeline
 
-Financial claim verification has unique retrieval challenges: exact numbers matter, temporal precision is critical (Q2 2025 vs Q2 2024), and metric specificity is essential ("Revenue" vs "Net Revenue" vs "Adjusted Revenue"). We use a multi-stage retrieval pipeline.
+Financial claim verification has unique retrieval challenges: exact numbers matter, temporal precision is critical (Q2 2025 vs Q2 2024), and metric specificity is essential ("Revenue" vs "Net Revenue" vs "Adjusted Revenue"). I use a multi-stage retrieval pipeline.
 
 ### Stage 1 — Deterministic Database Lookup
 
-Before any vector search, we attempt a direct database query against our structured financial data in PostgreSQL. Since our financial data is stored in structured form (via edgartools/SEC EDGAR), many claims can be verified purely through SQL/DataFrame lookups:
+Before any vector search, I attempt a direct database query against our structured financial data in PostgreSQL. Since our financial data is stored in structured form (via edgartools/SEC EDGAR), many claims can be verified purely through SQL/DataFrame lookups:
 
 ```python
 current = financial_db.query(ticker="AAPL", metric="Revenue", quarter="Q2", year=2025)
@@ -135,11 +133,11 @@ prior = financial_db.query(ticker="AAPL", metric="Revenue", quarter="Q2", year=2
 actual_growth = (current - prior) / prior * 100
 ```
 
-This handles ~60-70% of straightforward claims without any LLM or vector search.
+This can handle ~60-70% of straightforward claims without any LLM or vector search.
 
 ### Stage 2 — Hybrid Sparse-Dense Retrieval
 
-For claims that reference non-standard metrics, segment data, or require context from filing text, we use hybrid retrieval over PostgreSQL with pgvector:[18][19]
+For claims that reference non-standard metrics, segment data, or require context from filing text, I use hybrid retrieval over PostgreSQL with pgvector:[18][19]
 
 **Sparse Component — SPLADE-v3**: Generates learned sparse vectors that outperform BM25 through term expansion. pgvector 0.7+ natively supports sparse vectors via the `sparsevec` type, so SPLADE embeddings are stored and queried directly in PostgreSQL. Critical for financial data because exact terms ("EBITDA", "free cash flow", "Q2 2025") need lexical matching, while SPLADE also expands to related terms.[20][21][22]
 
@@ -156,11 +154,11 @@ Hybrid retrieval achieves nDCG@10 of 0.741 vs 0.685 for dense-only.[24]
 
 ### Stage 3 — Cross-Encoder Reranking
 
-The reranking stage optimizes for precision using `cross-encoder/ms-marco-MiniLM-L12-v2`. Cross-encoders jointly encode query+document in a single transformer pass, enabling full cross-attention between tokens — this captures nuanced relevance like distinguishing "Q2 2025 revenue" from "Q2 2024 revenue" in the same document. Reranks top-100 candidates from Stage 2, returns top-10. Adding cross-encoder reranking boosts nDCG@10 from 0.741 to 0.812.[25][26][24]
+The reranking stage optimizes for precision using `cross-encoder/ms-marco-MiniLM-L12-v2`. Cross-encoders jointly encode query+document in a single transformer pass, enabling full cross-attention between tokens — this captures nuanced relevance like distinguishing "Q2 2025 revenue" from "Q2 2024 revenue" in the same document. Reranks top-100 candidates from Stage 2, returns top-10. [25][26][24]
 
 ### Financial-Domain Optimizations
 
-**Metadata-Based Pre-Filtering**: Following FinRAG research, documents are indexed with rich metadata (`ticker`, `quarter`, `year`, `metric_type`, `source_type`, `is_gaap`). When verifying an AAPL Q2 2025 revenue claim, we first filter via SQL WHERE clause to only AAPL + Q2 2025 rows, then run hybrid search within that subset.[27]
+**Metadata-Based Pre-Filtering**: Following FinRAG research, documents are indexed with rich metadata (`ticker`, `quarter`, `year`, `metric_type`, `source_type`, `is_gaap`). When verifying an AAPL Q2 2025 revenue claim, I first filter via SQL WHERE clause to only AAPL + Q2 2025 rows, then run hybrid search within that subset.[27]
 
 **Structural Chunking**: Financial documents are chunked by structural elements rather than fixed token windows — one chunk per line item per quarter for income statements, one chunk per speaker segment for transcripts. Each chunk retains full metadata headers.
 
@@ -168,7 +166,7 @@ The reranking stage optimizes for precision using `cross-encoder/ms-marco-MiniLM
 
 All data lives in a single PostgreSQL instance with pgvector extension:[28][18]
 
-- Structured financial data (revenue, EPS, income — the actual numbers we verify against)
+- Structured financial data (revenue, EPS, income — the actual numbers I verify against)
 - Vector embeddings (dense `vector` columns + sparse `sparsevec` columns for SPLADE)
 - Claim results and verdicts
 - Transcript text and metadata
@@ -215,11 +213,11 @@ CLAIM INPUT
 
 ## Verification Engine
 
-The verification step is the system's centerpiece. For each extracted claim, the system retrieves the relevant official data and checks it. For example, if the claim is "Revenue grew 15% YoY in Q2", we fetch Q2 revenue for this year and last year and compute the actual growth. If the numbers match (within an acceptable tolerance), the claim is verified; if not, it is flagged as a discrepancy.
+The verification step is the system's centerpiece. For each extracted claim, the system retrieves the relevant official data and checks it. For example, if the claim is "Revenue grew 15% YoY in Q2", I fetch Q2 revenue for this year and last year and compute the actual growth. If the numbers match (within an acceptable tolerance), the claim is verified; if not, it is flagged as a discrepancy.
 
 ### Deterministic Verification
 
-For straightforward claims mapping to known metrics, we compute the exact value programmatically:
+For straightforward claims mapping to known metrics, I compute the exact value programmatically:
 
 - **Growth claims (YoY/QoQ)**: `actual = (current - prior) / abs(prior) × 100`
 - **Absolute value claims**: Direct comparison
@@ -266,7 +264,7 @@ Each claim receives one of:
 
 ### Quarter-to-Quarter Discrepancy (Bonus)
 
-For every claim, we also compute the alternative time comparison. If a CEO claims high YoY growth, we also compute QoQ. If QoQ was flat or down, we flag this contextual discrepancy — showing if a figure jumps unusually between successive quarters.
+For every claim, I also compute the alternative time comparison. If a CEO claims high YoY growth, I also compute QoQ. If QoQ was flat or down, I flag this contextual discrepancy — showing if a figure jumps unusually between successive quarters.
 
 ---
 
@@ -274,40 +272,17 @@ For every claim, we also compute the alternative time comparison. If a CEO claim
 
 The system uses a tiered model architecture with automatic fallback, accessible through a unified OpenAI-compatible API interface.
 
-### Tier 1: Default Cloud — DeepSeek-R1-Distill-Llama-70B via Groq
+### Tier 1: Default Cloud — deepseek-v3.1:671b-cloud via ollama
 
-Groq offers this model free at 30 req/min with 128K context. The DeepSeek-R1 distillation into Llama-70B architecture delivers exceptional mathematical and factual precision. The OpenAI-compatible API makes it a drop-in replacement.[31][32]
-
-```python
-from groq import Groq
-client = Groq(api_key=os.environ["GROQ_API_KEY"])
-response = client.chat.completions.create(
-    model="deepseek-r1-distill-llama-70b",
-    messages=[{"role": "user", "content": verification_prompt}]
-)
-```
+I use the deepseek-v3.1:671b-cloud model via ollama as the default model for claim verification. It is a large language model that is trained on a massive dataset of text and code, and it is capable of performing a wide range of tasks, including claim verification.
 
 ### Tier 2: Premium Cloud — Claude Opus 4.1 / GPT-5
 
-For maximum accuracy: Claude Opus 4.1 (best accuracy-to-token-efficiency ratio on FinanceReasoning benchmarks) and GPT-5 (highest absolute accuracy on FinanceReasoning).[33][34]
-
-### Tier 3: Local Ollama — QwQ-32B / DeepSeek-R1:7b
-
-For fully offline operation: QwQ-32B (32B params, runs on consumer hardware with 4-bit quantization, competitive financial reasoning) and DeepSeek-R1:7b (7B params, runs on laptops with 8GB RAM).[35][36]
+For users who want to use their own models for maximum accuracy: I plan to add a feature for them to use their own API keys and run the verification engine.
 
 ### Plug-and-Play Switching
 
-All models are accessed through LiteLLM for a unified interface:
-
-```python
-MODEL_CONFIGS = {
-    "default": {"provider": "groq", "model": "deepseek-r1-distill-llama-70b"},
-    "premium_claude": {"provider": "anthropic", "model": "claude-opus-4-1"},
-    "premium_openai": {"provider": "openai", "model": "gpt-5"},
-    "local_qwq": {"provider": "ollama", "model": "qwq:32b"},
-    "local_small": {"provider": "ollama", "model": "deepseek-r1:7b"},
-}
-```
+All models are accessed through LiteLLM for a unified interface.
 
 ---
 
@@ -315,11 +290,11 @@ MODEL_CONFIGS = {
 
 To be robust, the system handles many edge cases:
 
-- **Missing or garbled data**: If an API lacks data for a quarter or the transcript lacks numeric detail, we skip or flag that claim.
-- **Non-numeric language**: Phrases like "double-digit growth" are interpreted as ranges (10–99%). If numeric data can't pin it down exactly, we mark it as "ambiguous" and present both ends of the range.
-- **Currency conversions**: If the transcript cites one currency and the financial report uses another, we convert using exchange rates from that date.
-- **One-time items**: Executives often exclude unusual costs ("adjusted"), so if a claim uses non-GAAP terms, we identify the related GAAP line and compare accordingly. If the LLM identifies "non-GAAP" wording, we retrieve both GAAP and non-GAAP figures.
-- **Composite statements**: e.g. "Revenue in Asia grew 20%". We handle this by retrieving segment data where available. If segment data isn't available, we note that limitation.
+- **Missing or garbled data**: If an API lacks data for a quarter or the transcript lacks numeric detail, I skip or flag that claim.
+- **Non-numeric language**: Phrases like "double-digit growth" are interpreted as ranges (10–99%). If numeric data can't pin it down exactly, I mark it as "ambiguous" and present both ends of the range.
+- **Currency conversions**: If the transcript cites one currency and the financial report uses another, I convert using exchange rates from that date.
+- **One-time items**: Executives often exclude unusual costs ("adjusted"), so if a claim uses non-GAAP terms, I identify the related GAAP line and compare accordingly. If the LLM identifies "non-GAAP" wording, I retrieve both GAAP and non-GAAP figures.
+- **Composite statements**: e.g. "Revenue in Asia grew 20%". I handle this by retrieving segment data where available. If segment data isn't available, I note that limitation.
 
 Handling these intricacies is informed by financial fact-checking research. Fin-Fact notes that financial claims often require understanding domain-specific terms and context. Our system annotates the reasoning (via the LLM's chain-of-thought) so auditors can see why a claim was marked false or misleading, echoing the "explainable" emphasis in FINDVER and FinChain.
 
@@ -327,90 +302,38 @@ Handling these intricacies is informed by financial fact-checking research. Fin-
 
 ## Architecture & Scalability
 
-We build the system in Python with a clear module structure. Key components (transcript ingestion, data lookup, claim extraction, verification, and UI) are decoupled. This microservices approach ensures each part can scale independently. The transcript-fetcher can run as a scheduled job; the verification engine can auto-scale behind an API gateway; and the UI is its own service. We use FastAPI for web/API endpoints because it is high-performance and natively async.
+I build the system in Python with a clear module structure. Key components (transcript ingestion, data lookup, claim extraction, verification, and UI) are decoupled.
 
-Our environment is managed by `uv` and a proper `pyproject.toml`, ensuring reproducibility. We containerize the app with Docker and deploy to the cloud. Each service runs in its own container with a load balancer in front.
+This microservices approach ensures each part can scale independently.
+
+The transcript-fetcher can run as a scheduled job;
+The claim extraction and document_chunker can run independently;
+
+Our environment is managed by `uv` and a proper `pyproject.toml`, ensuring reproducibility. I containerize the app with Docker and deploy to the cloud. Each service runs in its own container with a load balancer in front.
 
 ### Technology Stack
 
-| Component         | Technology                                                 |
-| ----------------- | ---------------------------------------------------------- |
-| Database          | PostgreSQL + pgvector (unified: structured data + vectors) |
-| Sparse Encoder    | SPLADE-v3 via FastEmbed → stored as pgvector `sparsevec`   |
-| Dense Encoder     | BGE-M3 / bge-large-en-v1.5 → stored as pgvector `vector`   |
-| Fusion            | Reciprocal Rank Fusion (k=60) in pure SQL                  |
-| Reranker          | cross-encoder/ms-marco-MiniLM-L12-v2                       |
-| Entity Pre-Filter | GLiNER (urchade/gliner_medium-v2.1)                        |
-| Claim Extraction  | LLM (Claimify-style pipeline)                              |
-| Verification LLM  | Tiered: Groq/Claude/GPT/Ollama                             |
-| Structured Data   | edgartools + SEC EDGAR XBRL                                |
-| Web Framework     | FastAPI                                                    |
-| UI                | Streamlit                                                  |
-| Package Manager   | uv                                                         |
-| Deployment        | Docker Compose (local/self-hosted) + Railway (cloud demo)  |
+| Component         | Technology                                                                    |
+| ----------------- | ----------------------------------------------------------------------------- |
+| Database          | PostgreSQL + pgvector (unified: structured data + vectors)                    |
+| Sparse Encoder    | SPLADE-v3 via FastEmbed → stored as pgvector `sparsevec`                      |
+| Dense Encoder     | BGE-M3 / bge-large-en-v1.5 → stored as pgvector `vector`                      |
+| Fusion            | Reciprocal Rank Fusion (k=60) in pure SQL                                     |
+| Reranker          | cross-encoder/ms-marco-MiniLM-L12-v2                                          |
+| Entity Pre-Filter | GLiNER (urchade/gliner_medium-v2.1)                                           |
+| Claim Extraction  | LLM (Claimify-style pipeline)                                                 |
+| Verification LLM  | Tiered: Groq/Claude/GPT/Ollama                                                |
+| Structured Data   | edgartools + SEC EDGAR XBRL                                                   |
+| Web Framework     | FastAPI                                                                       |
+| UI                | Streamlit                                                                     |
+| Package Manager   | uv                                                                            |
+| Deployment        | Streamlit Cloud for UI and fastAPI backend + NeonDB for PostgreSQL + pgvector |
 
 ---
 
-## Deployment Strategy
-
-### Primary: Docker Compose
-
-Docker Compose is the canonical deployment method — standard, reproducible, and vendor-agnostic. The entire stack (FastAPI backend, Streamlit UI, PostgreSQL with pgvector) runs with a single `docker compose up`:
-
-```yaml
-services:
-  db:
-    image: pgvector/pgvector:pg17
-    environment:
-      POSTGRES_DB: claimverifier
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
-  backend:
-    build: .
-    ports:
-      - "8000:8000"
-    depends_on:
-      - db
-    env_file:
-      - .env
-
-  ui:
-    build:
-      context: .
-      dockerfile: Dockerfile.ui
-    ports:
-      - "8501:8501"
-    depends_on:
-      - backend
-    env_file:
-      - .env
-
-volumes:
-  pgdata:
-```
-
-This is what goes in the README for anyone who wants to run the system locally or on their own infrastructure.
-
-### Cloud Demo: Railway
-
-For the live demo that interviewers can interact with, we deploy to Railway:[37][38]
-
-- Built-in managed PostgreSQL with pgvector support, auto-provisioned
-- Auto-deploys from GitHub on every push
-- Provides a public HTTPS URL immediately — interviewers click one link
-- $5 trial credit covers the demo period without needing a credit card[39]
-- Supports Docker-based deploys, so the same Dockerfile works locally and in production[40]
-
-The Streamlit UI can alternatively be hosted on Streamlit Community Cloud (free, unlimited public apps) for even simpler access.[41]
-
 ### Claude Skill (Bonus)
 
-As a lightweight bonus, we include a `SKILL.md` file in the repository that wraps our FastAPI API as a Claude Skill. This allows anyone with Claude Pro/Team to query the system conversationally (e.g., "Verify AAPL's revenue claims from Q2 2025"). It requires zero changes to the core system — just a single markdown file describing the skill's instructions and API endpoints.[42][43]
+As a lightweight bonus, I include a `SKILL.md` file in the repository that wraps our FastAPI API as a Claude Skill. This allows anyone with Claude Pro/Team to query the system conversationally (e.g., "Verify AAPL's revenue claims from Q2 2025"). It requires zero changes to the core system — just a single markdown file describing the skill's instructions and API endpoints.[42][43]
 
 ---
 
@@ -426,7 +349,7 @@ As a lightweight bonus, we include a `SKILL.md` file in the repository that wrap
 
 5. [EDGAR Application Programming Interfaces (APIs) - SEC.gov](https://www.sec.gov/search-filings/edgar-application-programming-interfaces) - The company-concept API returns all the XBRL disclosures from a single company (CIK) and concept (a ...
 
-6. [Downloading Company Financial Data Using the SEC EDGAR API](https://www.linkedin.com/pulse/downloading-company-financial-data-using-sec-edgar-api-rajagopal-2phcc) - We downloaded, organized, and queried the JSON file that contains the CIK, the company name, and the...
+6. [Downloading Company Financial Data Using the SEC EDGAR API](https://www.linkedin.com/pulse/downloading-company-financial-data-using-sec-edgar-api-rajagopal-2phcc) - I downloaded, organized, and queried the JSON file that contains the CIK, the company name, and the...
 
 7. [edgartools - Navigate Edgar filings with ease](https://pypi.org/project/edgartools/) - EdgarTools is a Python library for downloading and analyzing SEC EDGAR filings. Extract 10-K, 10-Q, ...
 
@@ -446,7 +369,7 @@ As a lightweight bonus, we include a `SKILL.md` file in the repository that wrap
 
 15. [Claimify: Extracting high-quality claims from language model outputs](https://www.microsoft.com/en-us/research/blog/claimify-extracting-high-quality-claims-from-language-model-outputs/) - A common strategy for fact-checking LLM-generated texts – especially complex, highly detailed output...
 
-16. [Towards Effective Extraction and Evaluation of Factual Claims](https://www.microsoft.com/en-us/research/publication/towards-effective-extraction-and-evaluation-of-factual-claims/) - We propose a framework for evaluating claim extraction and introduce Claimify, an LLM-based method t...
+16. [Towards Effective Extraction and Evaluation of Factual Claims](https://www.microsoft.com/en-us/research/publication/towards-effective-extraction-and-evaluation-of-factual-claims/) - I propose a framework for evaluating claim extraction and introduce Claimify, an LLM-based method t...
 
 17. [[PDF] Towards Effective Extraction and Evaluation of Factual Claims](https://aclanthology.org/2025.acl-long.348.pdf) - Claimify achieved the highest accuracy (87.9%) and macro F1 score (83.7%), fol- lowed by DnD (accura...
 
@@ -458,7 +381,7 @@ As a lightweight bonus, we include a `SKILL.md` file in the repository that wrap
 
 21. [[PDF] Reranking with Compressed Document Representation - arXiv](https://www.arxiv.org/pdf/2505.15394.pdf) - First, a late interaction architecture has been proposed for cross-encoder-based rerankers, but it c...
 
-22. [Similarity Search with SPLADE Inside Postgres - ParadeDB](https://www.paradedb.com/blog/introducing-sparse) - With the release of v0.7.0 , sparse vector support was added to pgvector . As a result, we have depr...
+22. [Similarity Search with SPLADE Inside Postgres - ParadeDB](https://www.paradedb.com/blog/introducing-sparse) - With the release of v0.7.0 , sparse vector support was added to pgvector . As a result, I have depr...
 
 23. [[PDF] ClimateCheck Task: Fact-Checking Social Media Claims](https://aclanthology.org/2025.sdp-1.24.pdf) - A clear pattern from subtask I is the use of hybrid pipelines, combining sparse retrievers (e.g., BM...
 
