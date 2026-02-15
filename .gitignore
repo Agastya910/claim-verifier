@@ -57,6 +57,9 @@ coverage.xml
 .DS_Store
 Thumbs.db
 
+# uv.lock contains heavy ML deps — exclude so Streamlit Cloud uses requirements.txt
+uv.lock
+
 # Project Specific
 .repopilot/
 verification_summary.json
