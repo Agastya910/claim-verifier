@@ -57,15 +57,7 @@ def get_session():
 
 # ─── Data Access Functions (replace httpx API calls) ────────────────────
 
-def check_health():
-    """Check database connectivity."""
-    try:
-        with Session(get_engine()) as db:
-            db.execute(select(1))
-        return {"status": "healthy"}
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return {"status": "unhealthy"}
+
 
 
 def list_companies():
@@ -436,12 +428,6 @@ st.sidebar.markdown("## 🔍 Claim Verifier")
 st.sidebar.caption("Earnings transcript verification system")
 st.sidebar.markdown("---")
 
-# System status
-health = check_health()
-if health and health.get("status") == "healthy":
-    st.sidebar.success("🟢 System Online")
-else:
-    st.sidebar.error("🔴 System Offline — check database connection")
 
 # ─── Section A: Companies ───────────────────────────────────────────────
 st.sidebar.subheader("🏢 Companies")
