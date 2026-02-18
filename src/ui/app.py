@@ -60,6 +60,7 @@ def get_session():
 
 
 
+@st.cache_data(ttl=604800, show_spinner=False)
 def list_companies():
     """Get unique tickers from transcripts + financial_data."""
     try:
@@ -71,6 +72,7 @@ def list_companies():
         return []
 
 
+@st.cache_data(ttl=604800, show_spinner=False)
 def get_results(ticker):
     """Get all claims and verdicts for a company."""
     ticker = ticker.upper()
@@ -110,6 +112,7 @@ def get_results(ticker):
         return None
 
 
+@st.cache_data(ttl=604800, show_spinner=False)
 def get_dashboard():
     """Aggregate dashboard data across all companies."""
     try:
@@ -158,6 +161,7 @@ def get_dashboard():
         return {"has_precomputed_data": False}
 
 
+@st.cache_data(ttl=604800, show_spinner=False)
 def get_quarters(ticker):
     """Get available (year, quarter) pairs for a company."""
     ticker = ticker.upper()
@@ -180,6 +184,7 @@ def get_quarters(ticker):
         return {"available_quarters": []}
 
 
+@st.cache_data(ttl=604800, show_spinner=False)
 def get_transcript(ticker, year, quarter):
     """Get raw transcript data."""
     try:
@@ -199,6 +204,7 @@ def get_transcript(ticker, year, quarter):
         return None
 
 
+@st.cache_data(ttl=604800, show_spinner=False)
 def get_financials(ticker, year, quarter):
     """Get raw financial data."""
     try:
