@@ -3,7 +3,7 @@
 > 🚨 **IMPORTANT** 🚨
 >
 > This README is just a canonical summary and deployment instructions.
-> **[PLEASE READ THE DESIGN OVERVIEW DOCUMENT](Design%20Overview)**.
+> **[PLEASE READ THE DESIGN OVERVIEW DOCUMENT](Design%20Overview.pdf)**.
 
 Automated financial claim verification system that cross-references earnings call transcripts against official SEC EDGAR data using LLMs and RAG.
 
